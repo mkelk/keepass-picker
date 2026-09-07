@@ -271,4 +271,6 @@ desktop app need not be running at all.
 
 ## License
 
-MIT.
+MIT. `bin/keepass-picker-insert` is derived from an MIT-licensed Omarchy script;
+its notice is in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). Not
+affiliated with or endorsed by the KeePass or KeePassXC projects.
