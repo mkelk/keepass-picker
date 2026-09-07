@@ -1,0 +1,211 @@
+#!/bin/bash
+# Thin client for keepass-agent. Speaks newline-delimited JSON over the agent's
+# AF_UNIX socket and prints the reply on stdout.
+#
+# Nothing here ever sees a secret: `search` returns entry paths, and `insert`
+# tells the agent to paste -- the value never crosses the socket.
+#
+# Usage:
+#   keepass-picker-ctl status
+#   keepass-picker-ctl unlock
+#   keepass-picker-ctl search <term>
+#   keepass-picker-ctl insert <entry-path> [field] [expect-window]
+#   keepass-picker-ctl fill <entry-path> [expect-window]
+#   keepass-picker-ctl target
+#   keepass-picker-ctl lock
+#   keepass-picker-ctl configure          # pick the database
+#   keepass-picker-ctl preflight
+
+set -uo pipefail
+
+APP=keepass-picker
+BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$APP"
+SOCKET="$RUNTIME_DIR/agent.sock"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
+CONFIG="$CONFIG_DIR/config.json"
+
+umask 077
+
+die() { echo "$1" >&2; exit 1; }
+
+notify() {
+  if command -v omarchy-notification-send >/dev/null 2>&1; then
+    omarchy-notification-send "KeePass Picker" "$1"
+  else
+    echo "$1" >&2
+  fi
+}
+
+# Two failure states with different remedies: the engine is missing, or it is
+# present but no database has been chosen yet.
+preflight() {
+  local missing=()
+  for cmd in keepassxc-cli wtype wl-copy python3; do
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+  done
+  if (( ${#missing[@]} )); then
+    echo '{"ok":false,"state":"engine-missing","missing":["'"$(IFS=,; echo "${missing[*]}" | sed 's/,/","/g')"'"]}'
+    return 1
+  fi
+  local db
+  db=$(read_db)
+  if [[ -z $db ]]; then
+    echo '{"ok":false,"state":"no-database"}'
+    return 1
+  fi
+  if [[ ! -f $db ]]; then
+    echo '{"ok":false,"state":"missing-database"}'
+    return 1
+  fi
+  echo '{"ok":true,"state":"ready"}'
+}
+
+read_cfg() {
+  [[ -f $CONFIG ]] || return 0
+  python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))
+except Exception: pass' "$CONFIG" "$1"
+}
+
+read_db() { read_cfg database; }
+
+# Omarchy already has a file picker; do not build one.
+configure() {
+  local db roots
+  # ONE root, not "$HOME:$HOME/CloudDrive". omarchy-menu-file runs a plain
+  # `find` over the roots it is given and does not deduplicate, so overlapping
+  # roots list every file underneath twice -- and a cloud mount lives inside
+  # $HOME. Set search_paths in the config to override (colon-separated); keep
+  # the roots disjoint if you do.
+  roots=$(read_cfg search_paths)
+  [[ -n $roots ]] || roots="$HOME"
+
+  # omarchy-menu-file runs find to completion before the picker appears, and a
+  # $HOME that contains a FUSE cloud mount takes about 40 seconds. Say so,
+  # otherwise it looks hung. This is a one-time step; the picker itself never
+  # touches the filesystem this way.
+  notify "Scanning for .kdbx files — this takes a moment…"
+  db=$(omarchy-menu-file "Select KeePass database" "$roots" "kdbx") || exit 1
+  [[ -n $db ]] || exit 1
+  mkdir -p "$CONFIG_DIR"
+  # The path only. Never a master password.
+  python3 -c 'import json,os,sys
+path, db = sys.argv[1], sys.argv[2]
+cfg = {}
+if os.path.exists(path):
+    try: cfg = json.load(open(path))
+    except Exception: cfg = {}
+cfg["database"] = db
+tmp = path + ".tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as fh:
+    json.dump(cfg, fh, indent=2)
+os.replace(tmp, path)' "$CONFIG" "$db"
+  send '{"cmd":"reload"}' 2>/dev/null || true
+  echo "$db"
+}
+
+ensure_agent() {
+  [[ -S $SOCKET ]] && return 0
+  mkdir -p "$RUNTIME_DIR"
+  chmod 700 "$RUNTIME_DIR"
+
+  # Serialize the spawn. The bar widget polls every few seconds and the overlay
+  # calls in too, so several clients routinely find the socket missing at the
+  # same instant; without this every one of them starts an agent. The agent
+  # also refuses to run twice, but losing that race still costs a process
+  # launch and a log line each time.
+  exec 9>"$RUNTIME_DIR/spawn.lock"
+  # Bounded, never indefinite. The bar widget polls this every few seconds, and
+  # a ctl that blocks forever piles up Process objects inside omarchy-shell
+  # until the whole shell stops answering IPC. That happened once; it must not
+  # be reachable again.
+  flock -w 5 9 || { exec 9>&-; die "timed out waiting to start keepass-agent"; }
+
+  if [[ ! -S $SOCKET ]]; then
+    # 9>&- matters: without it the agent inherits the lock fd and holds the
+    # spawn lock for its whole life, so the next client blocks forever.
+    setsid "$BIN_DIR/keepass-agent" >/dev/null 2>>"$RUNTIME_DIR/agent.log" 9>&- &
+    for _ in {1..50}; do
+      [[ -S $SOCKET ]] && break
+      sleep 0.1
+    done
+  fi
+
+  exec 9>&-
+  [[ -S $SOCKET ]] || die "keepass-agent did not start (see $RUNTIME_DIR/agent.log)"
+}
+
+# $2 is the reply deadline in seconds. Everything except `unlock` is a machine
+# answering a machine and must fail fast; `unlock` waits on a human at a
+# pinentry dialog.
+send() {
+  ensure_agent
+  printf '%s\n' "$1" | python3 -c '
+import socket, sys
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.settimeout(float(sys.argv[2]))
+sock.connect(sys.argv[1])
+sock.sendall(sys.stdin.buffer.read())
+sock.shutdown(socket.SHUT_WR)
+data = b""
+while True:
+    chunk = sock.recv(65536)
+    if not chunk:
+        break
+    data += chunk
+sys.stdout.write(data.decode())' "$SOCKET" "${2:-15}"
+}
+
+json_request() {
+  python3 -c 'import json,sys; print(json.dumps(dict(zip(sys.argv[1::2], sys.argv[2::2]))))' "$@"
+}
+
+# Attach the focused window so the agent can rank by context. Read here rather
+# than in the agent because the caller knows the moment that matters.
+json_with_window() {
+  local win
+  win=$(hyprctl activewindow -j 2>/dev/null || echo '{}')
+  python3 -c '
+import json, sys
+payload = dict(zip(sys.argv[2::2], sys.argv[3::2]))
+try:
+    w = json.loads(sys.argv[1] or "{}")
+except ValueError:
+    w = {}
+if isinstance(w, dict) and w.get("address"):
+    payload["window"] = {"address": w.get("address"),
+                         "class": w.get("class") or "",
+                         "title": w.get("title") or ""}
+print(json.dumps(payload))' "$win" "$@"
+}
+
+cmd=${1:-status}
+shift || true
+
+case "$cmd" in
+  preflight) preflight ;;
+  configure) configure ;;
+  status)    send '{"cmd":"status"}' ;;
+  unlock)    send '{"cmd":"unlock"}' 300 ;;
+  lock)      send '{"cmd":"lock"}' ;;
+  reload)    send '{"cmd":"reload"}' ;;
+  target)    send '{"cmd":"target"}' ;;
+  search)
+    # search <term> [window-json]. The window is context for ranking, not a
+    # filter -- a filter that guesses wrong hides the entry you want.
+    send "$(json_with_window cmd search term "${1:-}")"
+    ;;
+  insert)
+    [[ $# -ge 1 ]] || die "usage: keepass-picker-ctl insert <entry-path> [field] [expect-window-address]"
+    send "$(json_request cmd insert entry "$1" field "${2:-Password}" expect_window "${3:-}")" 60
+    ;;
+  fill)
+    # The whole sequence -- username, Tab, password -- in one action, guarded
+    # against the focus moving between steps.
+    [[ $# -ge 1 ]] || die "usage: keepass-picker-ctl fill <entry-path> [expect-window-address]"
+    send "$(json_request cmd fill entry "$1" expect_window "${2:-}")" 60
+    ;;
+  *) die "unknown command: $cmd" ;;
+esac

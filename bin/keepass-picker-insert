@@ -1,0 +1,45 @@
+#!/bin/bash
+# Paste a secret into the focused window.
+#
+# The secret arrives on STDIN and is never an argument: /proc/<pid>/cmdline is
+# world-readable to the same user and `ps` prints it.
+#
+# Based on omarchy-menu-emoji-insert, with voxtype's delivery lessons. Every
+# element below earns its place -- see docs/HANDOVER.md, "Secure insertion".
+
+set -uo pipefail
+
+paste_key="${KEEPASS_PICKER_PASTE_KEY:-shift+Insert}"
+pre_type_delay="${KEEPASS_PICKER_PRE_TYPE_DELAY:-0.15}"
+
+secret=$(cat)
+[[ -n $secret ]] || { echo "keepass-picker-insert: nothing on stdin" >&2; exit 1; }
+
+# Split "ctrl+shift+v" into wtype modifier flags plus the final key.
+IFS='+' read -ra parts <<<"$paste_key"
+key="${parts[-1]}"
+unset 'parts[-1]'
+press=() release=()
+for mod in "${parts[@]}"; do
+  press+=(-M "$mod")
+  release+=(-m "$mod")
+done
+
+# --sensitive is what keeps this out of ~/.local/state/omarchy/clipboard-history.json.
+# --foreground plus the kill means the clipboard owner dies, so the secret
+# leaves the clipboard entirely rather than lingering there.
+printf '%s' "$secret" | wl-copy --type text/plain --sensitive --foreground &
+copy_pid=$!
+unset secret
+
+# Virtual keyboards need a moment to attach; without this the keystroke is
+# delivered before the compositor is listening.
+sleep "$pre_type_delay"
+
+# Paste rather than type: wtype emits the wrong symbols under non-US keymaps,
+# and that corruption is invisible on a string you cannot see.
+wtype "${press[@]}" -k "$key" "${release[@]}" 2>/dev/null || true
+
+sleep 0.2
+kill "$copy_pid" 2>/dev/null || true
+wait "$copy_pid" 2>/dev/null || true

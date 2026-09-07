@@ -1,0 +1,54 @@
+#!/bin/bash
+# Install this working tree as the plugin, for testing on the live desktop.
+#
+# Mirrors the repo rather than symlinking it: the repo root IS the plugin
+# folder, because `omarchy plugin add <git-url>` clones the repository and
+# installs the clone root. Copying the whole thing (minus .git) installs
+# exactly the shape a user gets from a clone -- tests, docs and scripts ride
+# along, and the shell loads only what the manifest declares.
+#
+# --restart also restarts the whole shell. Plain QML edits hot-reload on their
+# own, so you rarely need it; reach for it when the plugin set changed in a way
+# rescanPlugins did not settle.
+
+set -euo pipefail
+
+restart=false
+[[ ${1:-} == "--restart" ]] && restart=true
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+target="$HOME/.config/omarchy/plugins/mkelk.keepass-picker"
+
+omarchy plugin validate "$repo_root"
+
+mkdir -p "$target"
+rsync -a --delete --exclude='.git/' --exclude='__pycache__/' "$repo_root/" "$target/"
+
+# Only needed when the plugin SET changed (a new plugin, a manifest edit), but
+# it is cheap and removes one class of "why is my change not showing".
+omarchy-shell shell rescanPlugins
+
+note=""
+if [[ $restart == true ]]; then
+  # A restart kills the lock screen: omarchy.lock runs inside the same
+  # Quickshell process.
+  if [[ $(omarchy-shell lock isLocked 2>/dev/null) == "true" ]]; then
+    echo "The session is locked. Refusing to restart the shell." >&2
+    exit 1
+  fi
+  omarchy-restart-shell
+  note=" (shell restarted)"
+fi
+
+echo "dev-install: $repo_root -> $target$note"
+
+cat <<'HINT'
+
+Next: choose a database and add a keybinding.
+
+  ~/.config/omarchy/plugins/mkelk.keepass-picker/bin/keepass-picker-ctl configure
+
+Then in ~/.config/hypr/bindings.lua -- Lua, not .conf:
+
+  o.bind("SUPER + SHIFT + K", "KeePass Picker", "omarchy-shell shell toggle mkelk.keepass-picker")
+HINT
