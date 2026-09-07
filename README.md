@@ -234,6 +234,41 @@ helper, and asserts afterwards that the live session was untouched.
 How the pieces fit, the rules a change must keep, and the traps a developer
 will hit are in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
+## Acknowledgements
+
+This plugin stands on other people's work, and it is worth saying which.
+
+- **[Omarchy](https://github.com/omacom/omarchy)** (MIT) — the shell and its
+  plugin system, obviously; and more specifically the paste helper.
+  `bin/keepass-picker-insert` is derived from Omarchy's own
+  `omarchy-menu-emoji-insert`: `wl-copy --sensitive --foreground`, press the
+  paste key, kill the clipboard owner. The picker's chrome follows the shipped
+  overlays — the clipboard manager for the list shape, the Tailscale panel for
+  the accent ring.
+- **[1Passchy](https://github.com/rafaelsantana6/1passchy)** (MIT) by Rafael
+  Santana — a read-only 1Password plugin for the same bar. Its `op-bridge` script
+  states a four-rule security contract in its header: a secret never reaches
+  QML, a secret never appears in `argv`, copies are marked `--sensitive`,
+  authentication is never handled in the bridge. Those rules were adopted here
+  unchanged, and the first three are the spine of this plugin's design. Also
+  lifted: `umask 077`, a `0700` state directory, `0600` files, atomic replace,
+  JSON-only stdout.
+- **[voxtype](https://voxtype.io)** (MIT) — push-to-talk voice typing for
+  Linux. Its output layer is the most considered text-injection code around,
+  and its lessons shaped the paste path: paste rather than type, a
+  configurable paste keystroke because terminals want `Ctrl+Shift+V`, and a
+  pre-type delay because virtual keyboards drop the first character otherwise.
+  Lessons, not code.
+- **[KeePassXC](https://keepassxc.org)** — the engine. Every security property
+  this plugin claims about the vault is KeePassXC's: the non-dumpable process,
+  the format, the CLI that holds a database open. The plugin only asks it
+  questions.
+
+Related, and considered: [omarchy-keepassxc](https://github.com/japetheape/omarchy-keepassxc)
+shows the KeePassXC GUI's lock state in the bar by reading its window title.
+This plugin does not, because its session is independent of the GUI — the
+desktop app need not be running at all.
+
 ## License
 
 MIT.
