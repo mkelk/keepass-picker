@@ -38,11 +38,12 @@ Omarchy Quattro with third-party shell plugins enabled, and:
 | `python` | the agent |
 | `qt6ct` *(optional)* | paints the prompt in your Omarchy theme; without it the prompt is plain |
 
-```bash
-sudo pacman -S --needed keepassxc pinentry wl-clipboard wtype qt6ct
-```
+Install them with your package manager; every one is in the Arch
+repositories.
 
 No AUR package, no runtime network dependency, no privileged helper, no sudo.
+The plugin installs nothing and elevates nothing — it only asks for programs
+you already chose to have.
 
 ## Install
 
@@ -221,8 +222,7 @@ own Qt or GTK configuration is written. It follows a theme switch with no work.
 ## Development
 
 ```bash
-./scripts/dev-install --restart   # mirror this tree into ~/.config/omarchy/plugins and restart the shell
-./tests/run-all.sh                # the gate: 8 steps, ~3 min
+./tests/run-all.sh          # the gate: 8 steps, ~3 min
 omarchy plugin validate .
 ```
 
@@ -231,8 +231,16 @@ config, runtime directory, generated vault, stub pinentry and recording paste
 helper, and asserts afterwards that the live session was untouched.
 `tests/live-paste.sh` is the one exception and only runs when you ask it to.
 
-How the pieces fit, the rules a change must keep, and the traps a developer
-will hit are in [`CONTRIBUTING.md`](CONTRIBUTING.md).
+**This repository is the installed tree.** `omarchy plugin add` clones it and
+installs the clone root, so every file here lands in
+`~/.config/omarchy/plugins/mkelk.keepass-picker/` on someone else's machine.
+So nothing that serves only development ships: no agent-instruction file for a
+coding assistant to pick up, no installer, no contributor scripts. The tests
+stay, because the security claims above are worth only what you can check them
+against.
+
+Design notes, the rules a change must keep and the traps a developer will hit
+are kept outside this tree. Open an issue and ask.
 
 ## Acknowledgements
 
