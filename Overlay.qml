@@ -26,6 +26,35 @@ Item {
 
   readonly property string ctlPath: String(Qt.resolvedUrl("bin/keepass-picker-ctl")).replace("file://", "")
 
+  // What the client is started with, and NOTHING else the shell inherited. The
+  // agent it may spawn is handed the master password; a session that carries
+  // LD_PRELOAD, BASH_ENV or PYTHONPATH would otherwise carry them into it. The
+  // agent scrubs its own environment too -- this keeps the loader-time
+  // variables from ever reaching the interpreter. Mirrors KEEP_ENV in the agent.
+  readonly property var ctlEnvironment: {
+    var keep = ["HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "TZ",
+                "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME",
+                "XDG_CACHE_HOME", "XDG_DATA_DIRS", "XDG_CONFIG_DIRS",
+                "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP",
+                "WAYLAND_DISPLAY", "DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS",
+                "HYPRLAND_INSTANCE_SIGNATURE", "XCURSOR_THEME", "XCURSOR_SIZE",
+                "QT_QPA_PLATFORM", "QT_QPA_PLATFORMTHEME", "QT_STYLE_OVERRIDE",
+                "QT_SCALE_FACTOR", "QT_AUTO_SCREEN_SCALE_FACTOR", "QT_ENABLE_HIGHDPI_SCALING",
+                "QT_WAYLAND_DISABLE_WINDOWDECORATION", "QT_FONT_DPI",
+                "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_PAPER", "LC_TIME", "LC_NUMERIC"]
+    var env = { "PATH": "/usr/bin" }
+    for (var i = 0; i < keep.length; i++) {
+      var value = Quickshell.env(keep[i])
+      if (value !== null && value !== undefined) env[keep[i]] = String(value)
+    }
+    return env
+  }
+
+  function ctl(args) {
+    return { command: [root.ctlPath].concat(args), clearEnvironment: true,
+             environment: root.ctlEnvironment }
+  }
+
   property bool opened: false
   property string filterText: ""
   property int selectedIndex: 0
@@ -424,7 +453,11 @@ Item {
       url = "https://" + url
     }
     root.dismiss()
-    Quickshell.execDetached(["xdg-open", url])
+    // The absolute path: the shell's PATH has user-writable directories ahead
+    // of /usr/bin, and this is the one program the plugin runs that the agent
+    // does not resolve for it.
+    Quickshell.execDetached({ command: ["/usr/bin/xdg-open", url],
+                              clearEnvironment: true, environment: root.ctlEnvironment })
   }
 
   // Hosts are what you recognise; the scheme and path are noise at this size.
@@ -450,9 +483,9 @@ Item {
     var target = root.targetAddress
     root.dismiss()
     if (mode === "fill")
-      Quickshell.execDetached([root.ctlPath, "fill", entryPath, target])
+      Quickshell.execDetached(root.ctl(["fill", entryPath, target]))
     else
-      Quickshell.execDetached([root.ctlPath, "insert", entryPath, field || "Password", target])
+      Quickshell.execDetached(root.ctl(["insert", entryPath, field || "Password", target]))
   }
 
   // Step aside for pinentry.
@@ -551,28 +584,38 @@ Item {
   Process {
     id: statusProc
     command: [root.ctlPath, "status"]
+    clearEnvironment: true
+    environment: root.ctlEnvironment
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.applyStatus(text) }
   }
 
   Process {
     id: targetProc
     command: [root.ctlPath, "target"]
+    clearEnvironment: true
+    environment: root.ctlEnvironment
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.applyTarget(text) }
   }
 
   Process {
     id: searchProc
+    clearEnvironment: true
+    environment: root.ctlEnvironment
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.applyResults(text) }
   }
 
   Process {
     id: lockProc
     command: [root.ctlPath, "lock"]
+    clearEnvironment: true
+    environment: root.ctlEnvironment
   }
 
   Process {
     id: unlockProc
     command: [root.ctlPath, "unlock"]
+    clearEnvironment: true
+    environment: root.ctlEnvironment
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {

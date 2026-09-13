@@ -421,17 +421,89 @@ class HelpersComeFromUsrBinOnly(unittest.TestCase):
         self.assertNotIn("os.environ.get", paste)
         self.assertNotIn("KEEPASS_PICKER_INSERT", src)
 
-    def test_the_interpreter_is_not_looked_up_in_path(self):
+    def test_the_interpreter_is_not_looked_up_in_path_and_ignores_the_environment(self):
+        # -I: no PYTHONPATH, no user site-packages, no sitecustomize from
+        # either, no script directory on sys.path from the cwd.
         for name in ("keepass-agent", "keepass_agent.py"):
             with self.subTest(name=name):
                 with open(os.path.join(BIN, name)) as fh:
-                    self.assertEqual(fh.readline().strip(), "#!/usr/bin/python3")
+                    self.assertEqual(fh.readline().strip(), "#!/usr/bin/python3 -I")
 
     def test_the_client_pins_path_before_running_anything(self):
         with open(os.path.join(BIN, "keepass-picker-ctl")) as fh:
             src = fh.read()
         pinned = src.index("\nexport PATH=/usr/bin\n")
         self.assertLess(pinned, src.index("BIN_DIR=$("))
+        self.assertNotRegex(src, r"(^|[|;&(]\s*)python3 ", "a python3 run by name")
+        self.assertNotIn("python3 -c", src.replace("/usr/bin/python3 -I -c", ""))
+
+    def test_the_agent_scrubs_its_environment_before_anything_runs(self):
+        with open(os.path.join(BIN, "keepass_agent.py")) as fh:
+            src = fh.read()
+        main = src[src.index("def main("):]
+        self.assertLess(main.index("scrub_environment()"), main.index("Agent()"))
+        self.assertLess(main.index("harden_process()"), main.index("Agent()"))
+        for name in ("LD_PRELOAD", "PYTHONPATH", "BASH_ENV", "QT_PLUGIN_PATH", "SHELLOPTS"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, ka.KEEP_ENV)
+
+    def test_cli_arguments_are_terminated_before_the_entry(self):
+        # keepassxc-cli's shell strips our quotes before its option parser
+        # runs, so an entry named "-x" is an option unless `--` precedes it.
+        with open(os.path.join(BIN, "keepass_agent.py")) as fh:
+            src = fh.read()
+        for call in re.findall(r'self\.run\(f?"([^"]*)"', src):
+            if call.startswith(("show", "search")):
+                with self.subTest(call=call):
+                    self.assertIn(" -- {kpquote(", call)
+
+    def test_the_overlay_runs_xdg_open_by_absolute_path(self):
+        src = qml_code("Overlay.qml")
+        self.assertNotRegex(src, r'\["xdg-open"')
+        self.assertIn('"/usr/bin/xdg-open"', src)
+
+    def test_the_overlay_starts_the_client_with_a_cleared_environment(self):
+        src = qml_code("Overlay.qml")
+        launches = len(re.findall(r"\bProcess\s*\{", src))
+        self.assertGreater(launches, 0)
+        # Every Process, plus xdg-open, plus the ctl() context builder.
+        self.assertEqual(src.count("clearEnvironment: true"), launches + 2)
+        # The one launch that keeps the desktop's environment is `configure`:
+        # it opens Omarchy's file picker, touches no secret, and (see ctl)
+        # never starts the agent.
+        bare = re.findall(r"execDetached\(\[([^\]]*)\]", src)
+        self.assertEqual(bare, ['root.ctlPath, "configure"'])
+
+
+class TheInsertHelperGuardsThePaste(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(REPO, "bin", "keepass-picker-insert")) as fh:
+            cls.src = fh.read()
+
+    def test_the_clipboard_owner_dies_however_the_helper_ends(self):
+        self.assertRegex(self.src, r"trap 'kill \"\$copy_pid\"[^']*' EXIT")
+        self.assertLess(self.src.index("copy_pid=$!"), self.src.index("trap 'kill"))
+
+    def test_focus_is_checked_before_the_secret_is_read_and_before_the_key(self):
+        first = self.src.index("focus_is ||")
+        self.assertLess(first, self.src.index("secret=$(cat)"))
+        last = self.src.rindex("focus_is ||")
+        self.assertLess(self.src.index('sleep "$pre_type_delay"'), last)
+        self.assertLess(last, self.src.index('"$wtype" "${press[@]}"'))
+
+    def test_a_mismatched_window_refuses_before_touching_the_clipboard(self):
+        # Runs the real helper: it exits before wl-copy, so no clipboard.
+        proc = subprocess.run(["/usr/bin/bash", os.path.join(REPO, "bin", "keepass-picker-insert")],
+                              input="probe", capture_output=True, text=True,
+                              env=dict(os.environ, KEEPASS_PICKER_EXPECT_WINDOW="0xnotawindow"),
+                              timeout=20)
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("focus moved", proc.stderr)
+
+    def test_the_delay_is_clamped(self):
+        self.assertIn("[[ $pre_type_delay =~ ^([01](\\.[0-9]+)?|2(\\.0+)?)$ ]] || pre_type_delay=0.15\n",
+                      self.src)
 
 
 class BarWidgetRunsNoProcess(unittest.TestCase):

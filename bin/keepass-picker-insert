@@ -45,6 +45,26 @@ wtype=$(system_binary wtype) || { echo "keepass-picker-insert: no root-owned wty
 
 paste_key="${KEEPASS_PICKER_PASTE_KEY:-shift+Insert}"
 pre_type_delay="${KEEPASS_PICKER_PRE_TYPE_DELAY:-0.15}"
+expect_window="${KEEPASS_PICKER_EXPECT_WINDOW:-}"
+
+# The delay is how long the secret sits in the clipboard before the paste key.
+# The agent clamps it; so does this, in case something else set the variable.
+[[ $pre_type_delay =~ ^([01](\.[0-9]+)?|2(\.0+)?)$ ]] || pre_type_delay=0.15
+
+# The window the caller confirmed the paste for, re-checked here right before
+# the key is pressed: the wait for the virtual keyboard below is exactly when
+# a focus change would otherwise slip through. Unknown counts as moved.
+focus_is() {
+  local hyprctl
+  [[ -n $expect_window ]] || return 0
+  hyprctl=$(system_binary hyprctl) || return 1
+  [[ $("$hyprctl" activewindow -j 2>/dev/null | /usr/bin/python3 -I -c '
+import json, sys
+try: print(json.load(sys.stdin).get("address", ""))
+except Exception: print("")') == "$expect_window" ]]
+}
+
+focus_is || { echo "keepass-picker-insert: focus moved; nothing pasted" >&2; exit 3; }
 
 secret=$(cat)
 [[ -n $secret ]] || { echo "keepass-picker-insert: nothing on stdin" >&2; exit 1; }
@@ -65,15 +85,19 @@ done
 printf '%s' "$secret" | "$wl_copy" --type text/plain --sensitive --foreground &
 copy_pid=$!
 unset secret
+# However this script ends -- a signal, the agent dying, an error below -- the
+# clipboard owner dies with it, so the secret never outlives the paste.
+trap 'kill "$copy_pid" 2>/dev/null; wait "$copy_pid" 2>/dev/null' EXIT
+trap 'exit 130' INT TERM HUP
 
 # Virtual keyboards need a moment to attach; without this the keystroke is
 # delivered before the compositor is listening.
 sleep "$pre_type_delay"
+
+focus_is || { echo "keepass-picker-insert: focus moved; nothing pasted" >&2; exit 3; }
 
 # Paste rather than type: wtype emits the wrong symbols under non-US keymaps,
 # and that corruption is invisible on a string you cannot see.
 "$wtype" "${press[@]}" -k "$key" "${release[@]}" 2>/dev/null || true
 
 sleep 0.2
-kill "$copy_pid" 2>/dev/null || true
-wait "$copy_pid" 2>/dev/null || true

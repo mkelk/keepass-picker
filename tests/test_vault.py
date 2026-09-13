@@ -34,6 +34,44 @@ class VaultTestCase(unittest.TestCase):
         self.addCleanup(self.vault.lock)
 
 
+class ValuesSpanningLinesAreNotTyped(unittest.TestCase):
+    """What the pane shows must be what a paste would type.
+
+    `show -a UserName -a URL` prints both as consecutive lines, so a username
+    with a line break in it used to be read as a username AND an attacker's
+    URL -- and the typed username was both lines while the pane showed one.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = sandbox()
+        cls.db = make_vault(cls.root, entries={"Multi": "val-multi", "Plain": "val-plain"},
+                            usernames={"Multi": "support\nhttps://evil.example"})
+        cls.vault = ka.Vault(cls.db)
+        cls.vault.unlock(PROBE_PASSWORD)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.vault.lock()
+        cleanup(cls.root)
+
+    def test_the_pane_is_not_shown_a_forged_url(self):
+        info = self.vault.meta("/Multi")
+        self.assertEqual(info["url"], "")
+        self.assertNotIn("evil", info["url"])
+        self.assertTrue(info["username"].startswith("support"))
+        self.assertIn("⏎", info["username"])
+
+    def test_the_value_is_refused_rather_than_typed(self):
+        with self.assertRaises(ka.LockedError) as caught:
+            self.vault.field("/Multi", "UserName")
+        self.assertIn("several lines", str(caught.exception))
+
+    def test_single_line_values_are_untouched(self):
+        self.assertEqual(self.vault.meta("/Plain"), {"username": "u", "url": ""})
+        self.assertEqual(self.vault.field("/Plain", "Password"), "val-plain")
+
+
 class Unlocking(VaultTestCase):
     def test_unlock_then_locked_state_is_reported_truthfully(self):
         self.assertFalse(self.vault.unlocked)

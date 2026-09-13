@@ -27,6 +27,9 @@ PROBE_ENTRIES = {
     'Quote"Name':     "val-dquote",
     "Single'Quote":   "val-squote",
     "Back\\slash":    "val-bslash",
+    # keepassxc-cli's shell strips the quotes before its option parser runs,
+    # so without `--` this one is read as an option and answers nothing.
+    "-Dash":          "val-dash",
 }
 
 
@@ -38,7 +41,7 @@ def sandbox():
     return root
 
 
-def make_vault(root, password=PROBE_PASSWORD, entries=None):
+def make_vault(root, password=PROBE_PASSWORD, entries=None, usernames=None):
     """Build a real .kdbx from scratch.
 
     Generated, never a committed fixture: a checked-in vault would need its
@@ -46,10 +49,11 @@ def make_vault(root, password=PROBE_PASSWORD, entries=None):
     into resembling anything real.
     """
     entries = PROBE_ENTRIES if entries is None else entries
+    usernames = usernames or {}
     path = os.path.join(root, "probe.kdbx")
     run_cli(["db-create", "-p", path], f"{password}\n{password}\n")
     for title, value in entries.items():
-        run_cli(["add", "-p", "-u", "u", path, title],
+        run_cli(["add", "-p", "-u", usernames.get(title, "u"), "--", path, title],
                 f"{password}\n{value}\n{value}\n")
     return path
 
@@ -134,7 +138,7 @@ def plugin_ctl(root):
 # -- a live master-password dialog, and a hung run. wtype and the notifiers
 # are recorders: a fill presses Tab, and the real wtype would send it to
 # whatever window has focus.
-AGENT_UNDER_TEST = '''#!/usr/bin/python3
+AGENT_UNDER_TEST = '''#!/usr/bin/python3 -I
 import os
 import sys
 
@@ -152,6 +156,9 @@ def system_binary(name):
 
 
 keepass_agent.system_binary = system_binary
+# The stub pinentry reads the probe password from FAKE_PIN, which the agent's
+# environment allowlist would otherwise drop.
+keepass_agent.KEEP_ENV = keepass_agent.KEEP_ENV + ("FAKE_PIN",)
 keepass_agent.main()
 '''
 
@@ -215,6 +222,32 @@ def hostile_path(root):
     return bindir
 
 
+# The environment-borne ways to land code in a child, each recording that it
+# fired. PYTHONPATH: python imports sitecustomize from it at startup unless
+# run with -I. BASH_ENV: bash sources it before a script's first line.
+# LD_PRELOAD: the loader would map it into every dynamically linked child (a
+# path that does not exist, so it only ever warns -- its absence downstream
+# is what the tests read). SHELLOPTS=xtrace would make bash print every
+# expanded command, `printf '%s' "$secret"` included, to stderr.
+INJECTED_ENV = ("PYTHONPATH", "BASH_ENV", "LD_PRELOAD", "SHELLOPTS",
+                "QT_PLUGIN_PATH", "GTK_MODULES")
+
+
+def hostile_env(root, base):
+    """`base` plus every injection variable, pointed at recorders."""
+    hostile = hostile_path(root)
+    with open(os.path.join(hostile, "sitecustomize.py"), "w") as fh:
+        fh.write(f"open({hijack_log(root)!r}, 'a').write('sitecustomize\\n')\n")
+    with open(os.path.join(hostile, "bash_env"), "w") as fh:
+        fh.write(f"printf '%s\\n' bash_env >> {hijack_log(root)!r}\n")
+    return dict(base,
+                PYTHONPATH=hostile,
+                BASH_ENV=os.path.join(hostile, "bash_env"),
+                LD_PRELOAD=os.path.join(hostile, "no-such-preload.so"),
+                QT_PLUGIN_PATH=hostile,
+                GTK_MODULES="no-such-module")
+
+
 def recording_insert(root):
     """Replace the paste helper with one that records instead of pasting.
 
@@ -228,16 +261,27 @@ def recording_insert(root):
     path = os.path.join(bindir, "keepass-picker-insert")
     with open(path, "w") as fh:
         # Appends, so a fill sequence can be asserted as a sequence rather than
-        # only its last step.
-        # PATH pinned first, as the real helper does: this runs with whatever
-        # environment the agent has, which in NothingIsFoundThroughPath is hostile.
+        # only its last step. The environment it was handed is recorded too:
+        # it is exactly what the real helper, wl-copy and wtype would get.
         fh.write("#!/bin/bash\n"
-                 "export PATH=/usr/bin\n"
                  f"cat >> {record!r}\n"
                  f"printf '\\n' >> {record!r}\n"
-                 f"printf '%s\\n' \"$*\" >> {argv_log!r}\n")
+                 f"printf '%s\\n' \"$*\" >> {argv_log!r}\n"
+                 # Minus FAKE_PIN, the stub pinentry's own input, so the "no
+                 # file under the sandbox holds the master password" assertion
+                 # stays honest.
+                 f"env | grep -v '^FAKE_PIN=' > {helper_env_path(root)!r}\n")
     os.chmod(path, 0o755)
     return path, record, argv_log
+
+
+def helper_env_path(root):
+    return os.path.join(root, "helper.env")
+
+
+def read_env_file(path):
+    with open(path) as fh:
+        return dict(line.rstrip("\n").split("=", 1) for line in fh if "=" in line)
 
 
 def sandbox_env(root, **extra):
@@ -282,23 +326,22 @@ def stop_agent(root, env=None):
 
 
 def agent_pids(runtime_dir):
-    """Every keepass-agent whose XDG_RUNTIME_DIR is this sandbox."""
-    found = []
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
-        try:
-            with open(f"/proc/{entry}/cmdline", "rb") as fh:
-                cmdline = fh.read().decode(errors="replace")
-            if "keepass-agent" not in cmdline and "keepass_agent" not in cmdline:
-                continue
-            with open(f"/proc/{entry}/environ", "rb") as fh:
-                environ = fh.read().decode(errors="replace")
-            if f"XDG_RUNTIME_DIR={runtime_dir}" in environ:
-                found.append(int(entry))
-        except OSError:
-            continue
-    return found
+    """The live keepass-agent of this runtime dir, as a list of 0 or 1 pids.
+
+    Read from the pid file the agent publishes beside its socket. The agent is
+    non-dumpable, so its /proc/<pid>/environ is closed even to its own user
+    and it cannot be found by matching XDG_RUNTIME_DIR there any more.
+    """
+    try:
+        with open(os.path.join(runtime_dir, "keepass-picker", "agent.pid")) as fh:
+            pid = int(fh.read().strip())
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            cmdline = fh.read().decode(errors="replace")
+    except (OSError, ValueError):
+        return []
+    if "keepass-agent" not in cmdline and "keepass_agent" not in cmdline:
+        return []
+    return [pid]
 
 
 def cleanup(root):

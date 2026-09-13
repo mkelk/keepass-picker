@@ -9,6 +9,7 @@ class in this file asserts exactly that.
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -17,12 +18,12 @@ import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from helpers import (BIN, HIJACKABLE, PROBE_ENTRIES, PROBE_PASSWORD,   # noqa: E402
-                     agent_pids, cleanup, ctl, desktop_log, fake_pinentry,
-                     hijack_log, hostile_path,
-                     make_vault, make_vault_at, plugin_bin, plugin_ctl, plugin_tree,
-                     recording_insert, sandbox, sandbox_env, stop_agent,
-                     write_config)
+from helpers import (BIN, HIJACKABLE, INJECTED_ENV, PROBE_ENTRIES,      # noqa: E402
+                     PROBE_PASSWORD, agent_pids, cleanup, ctl, desktop_log,
+                     fake_pinentry, helper_env_path, hijack_log, hostile_env,
+                     hostile_path, make_vault, make_vault_at, plugin_bin,
+                     plugin_ctl, plugin_tree, read_env_file, recording_insert,
+                     sandbox, sandbox_env, stop_agent, write_config)
 
 sys.path.insert(0, BIN)
 import keepass_agent as agent                                     # noqa: E402
@@ -951,21 +952,156 @@ class NothingIsFoundThroughPath(AgentTestCase):
                                        text=True).stdout.strip()
                 self.assertEqual(found, os.path.join(first, name))
 
-    def test_the_agent_inherits_only_usr_bin(self):
-        stop_agent(self.root, self.env)
-        time.sleep(1)
+    def test_the_agent_runs_under_the_system_interpreter_in_isolated_mode(self):
         self.ctl("status")
         pids = agent_pids(self.env["XDG_RUNTIME_DIR"])
         self.assertTrue(pids)
         for pid in pids:
-            with open(f"/proc/{pid}/environ", "rb") as fh:
-                self.assertIn(b"PATH=/usr/bin", fh.read().split(b"\0"))
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = fh.read().decode().split("\0")
+            self.assertEqual(argv[0], "/usr/bin/python3", argv)
+            self.assertIn("-I", argv[1:3], argv)
 
-    def test_the_agent_runs_under_the_system_interpreter(self):
+    def test_the_agent_is_not_dumpable(self):
+        # Non-dumpable closes /proc/<pid>/environ, maps and mem to every other
+        # process of this user, and rules out a core dump of a heap that held
+        # the master password. Readable environ would mean the flag is not set.
         self.ctl("status")
         for pid in agent_pids(self.env["XDG_RUNTIME_DIR"]):
-            exe = os.path.realpath(f"/proc/{pid}/exe")
-            self.assertTrue(exe.startswith("/usr/bin/python"), exe)
+            with self.assertRaises(PermissionError):
+                open(f"/proc/{pid}/environ", "rb").close()
+
+
+class NothingInTheEnvironmentReachesAChild(AgentTestCase):
+    """Absolute paths stop PATH substitution; the environment is the other way in.
+
+    The loader honours LD_PRELOAD, python imports sitecustomize from
+    PYTHONPATH, bash sources BASH_ENV before a script's first line, Qt loads
+    plugins from QT_PLUGIN_PATH. The agent is started here with all of them set
+    and recording; nothing it runs may see any of them.
+    """
+
+    def setUp(self):
+        stop_agent(self.root, self.env)
+        time.sleep(1)
+        for path in (hijack_log(self.root), helper_env_path(self.root)):
+            if os.path.exists(path):
+                os.unlink(path)
+        env = hostile_env(self.root, self.env)
+        sock = os.path.join(env["XDG_RUNTIME_DIR"], "keepass-picker", "agent.sock")
+        os.makedirs(os.path.dirname(sock), mode=0o700, exist_ok=True)
+        subprocess.Popen([os.path.join(plugin_bin(self.root), "keepass-agent")],
+                         env=env, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        for _ in range(50):
+            if os.path.exists(sock):
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("the agent did not start")
+
+    def test_the_paste_helper_gets_the_allowlist_and_nothing_else(self):
+        self.unlocked()
+        self.assertTrue(self.ctl("insert", "/Plain")["ok"])
+        got = read_env_file(helper_env_path(self.root))
+        for name in INJECTED_ENV:
+            self.assertNotIn(name, got)
+        self.assertEqual(got.get("PATH"), "/usr/bin")
+        self.assertEqual(got.get("XDG_RUNTIME_DIR"), self.env["XDG_RUNTIME_DIR"])
+        self.assertIn("KEEPASS_PICKER_PASTE_KEY", got)
+        unexpected = [k for k in got if k not in agent.KEEP_ENV
+                      and not k.startswith(("LC_", "KEEPASS_PICKER_"))
+                      and k not in ("PATH", "FAKE_PIN", "_", "SHLVL", "PWD", "OLDPWD")]
+        self.assertEqual(unexpected, [], f"leaked into the helper: {unexpected}")
+
+    def test_no_recorder_fired_anywhere_in_the_session(self):
+        self.unlocked()
+        self.ctl("search", "Plain")
+        self.ctl("fill", "/Plain")
+        self.ctl("lock")
+        fired = []
+        if os.path.exists(hijack_log(self.root)):
+            with open(hijack_log(self.root)) as fh:
+                fired = fh.read().split()
+        self.assertEqual(fired, [], f"code ran from the environment: {sorted(set(fired))}")
+
+
+class TheVaultLocksWhenTheCliMisbehaves(AgentTestCase):
+    """A keepassxc-cli that stops answering, or dies, mid-command.
+
+    Both were found in review. The read buffer of a `show -a Password` holds
+    the password, so the old error text -- the buffer -- put it in the reply.
+    And a timed-out command left its output unread in the pty, where the next
+    caller's `search` would collect it as its own answer.
+    """
+
+    def cli_pid(self):
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                    argv = fh.read().split(b"\0")
+            except OSError:
+                continue
+            if len(argv) > 2 and argv[0].endswith(b"keepassxc-cli") \
+                    and argv[2] == os.path.join(self.root, "probe.kdbx").encode():
+                return int(entry)
+        return None
+
+    def test_a_stalled_cli_yields_no_secret_and_locks_the_vault(self):
+        self.unlocked()
+        pid = self.cli_pid()
+        self.assertIsNotNone(pid, "no sandbox keepassxc-cli found")
+        os.kill(pid, signal.SIGSTOP)
+        try:
+            reply = self.ctl("insert", "/Plain")
+        finally:
+            try:
+                os.kill(pid, signal.SIGCONT)
+            except OSError:
+                pass
+        self.assertFalse(reply["ok"])
+        self.assertNotIn(SECRET, json.dumps(reply))
+        self.assertEqual(self.ctl("status")["state"], "locked")
+        # Nothing stale is served afterwards either.
+        self.unlocked()
+        self.assertEqual(paths(self.ctl("search", "Plain")), ["/Plain"])
+
+    def test_a_cli_that_dies_mid_command_yields_no_secret(self):
+        self.unlocked()
+        pid = self.cli_pid()
+        self.assertIsNotNone(pid)
+        os.kill(pid, signal.SIGKILL)
+        reply = self.ctl("insert", "/Plain")
+        self.assertFalse(reply["ok"])
+        self.assertNotIn(SECRET, json.dumps(reply))
+        self.assertEqual(self.ctl("status")["state"], "locked")
+
+
+class RequestsAreBounded(AgentTestCase):
+    def test_an_oversized_request_is_refused_and_the_agent_survives(self):
+        self.ctl("status")
+        sock = os.path.join(self.env["XDG_RUNTIME_DIR"], "keepass-picker", "agent.sock")
+        reply = raw_bytes(sock, b'{"cmd":"status","pad":"' + b"x" * (70 * 1024) + b'"}\n')
+        self.assertFalse(reply["ok"])
+        self.assertEqual(self.ctl("status")["ok"], True)
+
+    def test_a_client_that_dribbles_cannot_hold_the_agent(self):
+        self.ctl("status")
+        sock = os.path.join(self.env["XDG_RUNTIME_DIR"], "keepass-picker", "agent.sock")
+        import socket as _socket
+        client = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        client.connect(sock)
+        client.sendall(b'{"cmd":')                 # and then nothing
+        start = time.monotonic()
+        try:
+            out = subprocess.run([plugin_ctl(self.root), "status"], env=self.env,
+                                 capture_output=True, text=True, timeout=60)
+        finally:
+            client.close()
+        self.assertLess(time.monotonic() - start, 30)
+        self.assertTrue(json.loads(out.stdout)["ok"])
 
 
 def children_of(name):

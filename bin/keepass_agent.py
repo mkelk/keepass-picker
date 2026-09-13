@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -I
 """Session agent for keepass-picker.
 
 Holds one KeePass database unlocked by supervising an interactive
@@ -20,11 +20,14 @@ the focused window -- it cannot dump the vault. See
 docs/thoughts/2026-09-04-unlock-model-decision.md.
 """
 
+import ctypes
 import errno
 import json
 import os
 import pty
 import re
+import resource
+import secrets
 import select
 import signal
 import socket
@@ -76,11 +79,43 @@ def load_config():
     cfg = dict(DEFAULTS)
     try:
         with open(config_path()) as fh:
-            cfg.update(json.load(fh))
+            loaded = json.load(fh)
+        if isinstance(loaded, dict):
+            cfg.update(loaded)
     except FileNotFoundError:
         pass
     except (OSError, ValueError) as exc:
         log(f"config unreadable, using defaults: {exc}")
+    return validate_config(cfg)
+
+
+# The delays bound how long a secret sits on the clipboard waiting for the
+# paste key, so they are clamped rather than trusted: "pre_type_delay": 1e9
+# would otherwise hold the password in the clipboard forever.
+MAX_DELAY = 2.0
+
+
+def validate_config(cfg):
+    def number(key, low, high):
+        try:
+            value = float(cfg.get(key, DEFAULTS[key]))
+        except (TypeError, ValueError):
+            value = float(DEFAULTS[key])
+        if value != value or value < low or value > high:      # NaN, or out of range
+            value = float(DEFAULTS[key])
+        cfg[key] = value
+
+    number("pre_type_delay", 0.0, MAX_DELAY)
+    number("fill_step_delay", 0.0, MAX_DELAY)
+    number("idle_timeout", 0.0, 86400.0 * 7)
+    number("max_results", 1, 1000)
+    cfg["max_results"] = int(cfg["max_results"])
+    for key in ("database", "paste_key", "fill_sequence", "pinentry",
+                "pinentry_icon_theme", "mask_character", "search_paths"):
+        if key in cfg and not isinstance(cfg[key], str):
+            cfg[key] = DEFAULTS.get(key, "")
+    if not isinstance(cfg.get("allowed_fields"), list):
+        cfg["allowed_fields"] = list(DEFAULTS["allowed_fields"])
     return cfg
 
 
@@ -121,13 +156,29 @@ def status_path():
     return os.path.join(path, "keepass-picker.status.json")
 
 
+def write_private_text(path, text):
+    """Atomic replace, 0600, never a partially written file for a reader.
+
+    A fresh random name, created exclusively and never through a symlink, so
+    a planted link at a predictable ".tmp" name cannot redirect the write. No
+    path operation follows the rename.
+    """
+    tmp = f"{path}.{secrets.token_hex(6)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def write_private_json(path, payload):
-    """Atomic replace, 0600, never a partially written file for a reader."""
-    tmp = path + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        json.dump(payload, fh)
-    os.replace(tmp, path)
+    write_private_text(path, json.dumps(payload))
 
 
 def log(msg):
@@ -183,11 +234,18 @@ class Vault:
         return out.decode("utf-8", errors="replace")
 
     def _read_until_prompt(self, timeout=10.0):
+        """Read one command's output up to the next prompt.
+
+        Any failure LOCKS THE VAULT. The buffer read so far may hold the value
+        of a `show -a Password`, so it never travels in an error -- and a
+        timeout leaves unread bytes in the pty that the next command would
+        otherwise receive as its own answer, so the session is not reusable.
+        """
         out, deadline = "", time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self.proc.poll() is not None:
-                out += self._read(0.3)
-                raise LockedError(clean(out) or "keepassxc-cli exited")
+                self._teardown()
+                raise LockedError("keepassxc-cli exited; the vault is locked")
             ready, _, _ = select.select([self.master], [], [], 0.1)
             if not ready:
                 continue
@@ -200,7 +258,8 @@ class Vault:
             out += chunk.decode("utf-8", errors="replace")
             if clean(out).endswith(self.prompt):
                 return out
-        raise LockedError("timed out waiting for keepassxc-cli")
+        self._teardown()
+        raise LockedError("keepassxc-cli did not answer; the vault is locked")
 
     # -- lifecycle -------------------------------------------------------
 
@@ -314,36 +373,53 @@ class Vault:
             paths.append(line if line.startswith("/") else "/" + line)
         return paths
 
+    # `--` ends option parsing: the tokenizer strips our quotes before the Qt
+    # option parser sees the argument, so an entry or term beginning with "-"
+    # would otherwise be read as an option (verified: `show -a UserName "-x"`
+    # answers nothing, `show -a UserName -- "-x"` answers).
+
     def search(self, term):
-        out = self.run(f"search {kpquote(term)}")
+        out = self.run(f"search -- {kpquote(term)}")
         if any("No results for that search term" in ln for ln in out):
             return []
         return [ln for ln in out if ln.strip()]
 
     def meta(self, entry):
-        """UserName and URL for one entry, in a single round-trip.
+        """UserName and URL for one entry, for display.
 
         These two and no others. Notes are searched by keepassxc-cli but are
         never fetched: they hold PINs, PUKs and recovery codes, and the picker
         has no business putting those anywhere.
+
+        One attribute per round-trip: `show -a UserName -a URL` prints both as
+        consecutive lines, so a username containing a line break would have
+        been read as a username plus an attacker-chosen URL.
         """
-        out = self.run(f"show -a UserName -a URL {kpquote(entry)}")
-        for line in out:
-            if "Could not find entry with path" in line:
+        info = {}
+        for key, attribute in (("username", "UserName"), ("url", "URL")):
+            out = self.run(f"show -a {attribute} -- {kpquote(entry)}")
+            if any("Could not find entry with path" in ln for ln in out):
                 return {"username": "", "url": ""}
-        lines = [ln for ln in out]
-        return {"username": lines[0] if len(lines) > 0 else "",
-                "url": lines[1] if len(lines) > 1 else ""}
+            value = "\n".join(out).strip("\n")
+            # What the pane shows must be what a paste would type, and field()
+            # refuses a value spanning lines -- so the pane says so too.
+            info[key] = value.split("\n", 1)[0] + " ⏎…" if "\n" in value else value
+        return info
 
     def field(self, entry, name):
         """Fetch one attribute. The only method that yields a secret."""
-        out = self.run(f"show -a {kpquote(name)} {kpquote(entry)}")
+        out = self.run(f"show -a {kpquote(name)} -- {kpquote(entry)}")
         for ln in out:
             if "Could not find entry with path" in ln:
                 raise LockedError(f"no such entry: {entry}")
-            if ln.startswith("Unknown command"):
+            if ln.startswith(("Unknown command", "Unknown option", "ERROR:", "Usage:")):
                 raise LockedError("keepassxc-cli rejected the request")
-        return "\n".join(out).strip("\n")
+        value = "\n".join(out).strip("\n")
+        if "\n" in value:
+            # A line break pasted into a form submits it, and the pane could
+            # only ever have shown the first line. Refuse rather than diverge.
+            raise LockedError(f"{name} spans several lines; refusing to type it")
+        return value
 
 
 INJECTION_RE = re.compile(r"[\r\n\x00]")
@@ -435,6 +511,8 @@ def theme_colors():
         return {}
 
 
+COLOUR_RE = re.compile(r"#[0-9a-fA-F]{6}")
+
 # Qt6 QPalette colour roles, in the order qt6ct writes them.
 PALETTE_ROLES = (
     "WindowText", "Button", "Light", "Midlight", "Dark", "Mid", "Text",
@@ -500,6 +578,9 @@ def pinentry_theme_env(icon_preference=""):
     if not c:
         return {}
 
+    # Colours and nothing else reach the stylesheet: the theme file is
+    # user-writable, and a value that is not "#rrggbb" is dropped, not quoted.
+    c = {k: v for k, v in c.items() if COLOUR_RE.fullmatch(v)}
     bg = c.get("background", "#121212")
     field = c.get("lighter_background", c.get("dark_background", bg))
     fg = c.get("foreground", "#bebebe")
@@ -528,11 +609,11 @@ def pinentry_theme_env(icon_preference=""):
         os.makedirs(confdir, mode=0o700, exist_ok=True)
 
         scheme = os.path.join(confdir, "omarchy.conf")
-        with open(scheme, "w") as fh:
-            fh.write("[ColorScheme]\n"
-                     f"active_colors={active}\n"
-                     f"inactive_colors={active}\n"
-                     f"disabled_colors={disabled}\n")
+        write_private_text(scheme,
+                           "[ColorScheme]\n"
+                           f"active_colors={active}\n"
+                           f"inactive_colors={active}\n"
+                           f"disabled_colors={disabled}\n")
 
         # An explicit background, because the palette alone did not give one:
         # under Fusion the dialog came out translucent and the desktop behind
@@ -540,8 +621,7 @@ def pinentry_theme_env(icon_preference=""):
         # qt6ct takes a stylesheet even though pinentry rejects Qt's own
         # -stylesheet argument, so this is the way in.
         sheet = os.path.join(confdir, "omarchy.qss")
-        with open(sheet, "w") as fh:
-            fh.write(
+        write_private_text(sheet,
                 f"QWidget {{ background-color: {bg}; color: {fg}; }}\n"
                 f"QDialog, QMessageBox {{ background-color: {bg}; }}\n"
                 f"QLabel {{ background-color: transparent; color: {fg}; }}\n"
@@ -556,21 +636,21 @@ def pinentry_theme_env(icon_preference=""):
                 f"QProgressBar::chunk {{ background-color: {accent}; }}\n")
 
         icons = pinentry_icon_set(icon_preference)
-        with open(os.path.join(confdir, "qt6ct.conf"), "w") as fh:
-            fh.write("[Appearance]\n"
-                     "style=Fusion\n"
-                     "custom_palette=true\n"
-                     f"color_scheme_path={scheme}\n"
-                     + (f"icon_theme={icons}\n" if icons else "")
-                     + "standard_dialogs=default\n"
-                     "\n[Fonts]\n"
-                     'general="monospace,11,-1,5,50,0,0,0,0,0"\n'
-                     'fixed="monospace,11,-1,5,50,0,0,0,0,0"\n'
-                     "\n[Interface]\n"
-                     # QSettings reads a plain path back as a one-element
-                     # QStringList; the @Variant encoding qt6ct writes itself
-                     # is binary and not worth reproducing by hand.
-                     f"stylesheets={sheet}\n")
+        write_private_text(os.path.join(confdir, "qt6ct.conf"),
+                           "[Appearance]\n"
+                           "style=Fusion\n"
+                           "custom_palette=true\n"
+                           f"color_scheme_path={scheme}\n"
+                           + (f"icon_theme={icons}\n" if icons else "")
+                           + "standard_dialogs=default\n"
+                           "\n[Fonts]\n"
+                           'general="monospace,11,-1,5,50,0,0,0,0,0"\n'
+                           'fixed="monospace,11,-1,5,50,0,0,0,0,0"\n'
+                           "\n[Interface]\n"
+                           # QSettings reads a plain path back as a one-element
+                           # QStringList; the @Variant encoding qt6ct writes
+                           # itself is binary and not worth reproducing by hand.
+                           f"stylesheets={sheet}\n")
         return {"QT_QPA_PLATFORMTHEME": "qt6ct", "XDG_CONFIG_HOME": home}
     except OSError as exc:
         log(f"could not write the pinentry theme: {exc}")
@@ -607,14 +687,19 @@ def ask_password(database, preferred=None, cfg=None):
     # No stylesheet argument: pinentry parses its own options and rejects Qt's,
     # so `-stylesheet` gets "invalid option". The palette arrives through the
     # platform theme instead -- see pinentry_theme_env.
+    # os.environ is already the allowlist scrub_environment() left; nothing
+    # from the session that could load code into pinentry survives it.
     env = dict(os.environ)
     if binary.endswith("-qt"):
         env.update(pinentry_theme_env(cfg.get("pinentry_icon_theme", "")))
         # Half-size under XWayland on a scaled monitor. See wayland_env.
         env.update(wayland_env())
     proc = subprocess.Popen([binary], stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE, text=True, env=env)
-    name = os.path.basename(database) or "database"
+                            stdout=subprocess.PIPE, text=True, env=env,
+                            start_new_session=True)
+    # Assuan takes one line per command: the basename is escaped so a name
+    # cannot smuggle a line break or a percent into the exchange.
+    name = escape_assuan(os.path.basename(database) or "database")
 
     def send(line):
         proc.stdin.write(line + "\n")
@@ -653,18 +738,41 @@ def ask_password(database, preferred=None, cfg=None):
         send("BYE")
         return pin
     finally:
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                stream.close()
+            except OSError:
+                pass
+        reap(proc, 5)
+
+
+def reap(proc, timeout):
+    """Wait for a child; a child that will not go is killed with its group."""
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
         try:
-            proc.stdin.close()
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except OSError:
             pass
-        proc.wait(timeout=5)
+        proc.wait()
+
+
+def escape_assuan(value):
+    return "".join(f"%{ord(ch):02X}" if ch in "%\r\n" else ch for ch in value)
 
 
 def unescape_assuan(value):
+    """Decode Assuan %XX escapes. Malformed input fails with a constant message:
+    the value is the master password, and an exception carrying two of its
+    characters would end up in the log."""
     out, i = [], 0
     while i < len(value):
-        if value[i] == "%" and i + 2 < len(value) + 1:
-            out.append(chr(int(value[i + 1:i + 3], 16)))
+        if value[i] == "%":
+            try:
+                out.append(chr(int(value[i + 1:i + 3], 16)))
+            except ValueError:
+                raise LockedError("pinentry sent a malformed reply") from None
             i += 3
         else:
             out.append(value[i])
@@ -679,6 +787,53 @@ def unescape_assuan(value):
 # the real one. That covers the helpers that only decide where a secret lands
 # (hyprctl, wtype) too, and the interpreter: both shebangs name /usr/bin/python3.
 SYSTEM_BIN = "/usr/bin"
+
+# The environment every child gets, and nothing else. An absolute path stops
+# PATH substitution but a dynamically linked child still honours LD_PRELOAD,
+# Qt loads plugins from QT_PLUGIN_PATH, bash sources BASH_ENV before its first
+# line and python imports sitecustomize from PYTHONPATH -- each a way to land
+# code in a process that is handed the master password or a field. Only what
+# the desktop needs to draw a prompt, own a clipboard and press a key survives.
+KEEP_ENV = (
+    "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "TZ",
+    "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME",
+    "XDG_CACHE_HOME", "XDG_DATA_DIRS", "XDG_CONFIG_DIRS",
+    "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP",
+    "WAYLAND_DISPLAY", "DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS",
+    "HYPRLAND_INSTANCE_SIGNATURE", "XCURSOR_THEME", "XCURSOR_SIZE",
+    # Qt reads these as values, never as a place to load code from.
+    "QT_QPA_PLATFORM", "QT_QPA_PLATFORMTHEME", "QT_STYLE_OVERRIDE",
+    "QT_SCALE_FACTOR", "QT_AUTO_SCREEN_SCALE_FACTOR", "QT_ENABLE_HIGHDPI_SCALING",
+    "QT_WAYLAND_DISABLE_WINDOWDECORATION", "QT_FONT_DPI",
+)
+KEEP_ENV_PREFIXES = ("LC_",)
+
+
+def scrub_environment():
+    """Replace the inherited environment with the allowlist, PATH pinned."""
+    kept = {k: v for k, v in os.environ.items()
+            if k in KEEP_ENV or k.startswith(KEEP_ENV_PREFIXES)}
+    kept["PATH"] = SYSTEM_BIN
+    os.environ.clear()
+    os.environ.update(kept)
+
+
+def harden_process():
+    """Not dumpable, no core file.
+
+    The agent holds the master password for the instant between pinentry and
+    the pty, and every field it pastes. Non-dumpable means no core dump, and
+    /proc/<pid>/mem, environ and maps refused to every other process of this
+    user -- the boundary keepassxc-cli sets for itself, applied to us too.
+    """
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        PR_SET_DUMPABLE = 4
+        if libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+            log("could not set PR_SET_DUMPABLE")
+    except (OSError, AttributeError) as exc:
+        log(f"could not harden the process: {exc}")
 
 
 def _root_controlled(path):
@@ -796,8 +951,13 @@ def press(key):
         return False
 
 
-def paste(secret, cfg):
-    """Hand the secret to the insert helper on stdin -- never in argv."""
+def paste(secret, cfg, expect_window=""):
+    """Hand the secret to the insert helper on stdin -- never in argv.
+
+    The helper gets the expected window too, and checks it again right before
+    the paste key: the delay it waits for the virtual keyboard is exactly when
+    a focus change would otherwise go unnoticed.
+    """
     # Always the helper beside this file, never one named by the environment:
     # whatever runs here is handed the secret. The test suite substitutes its
     # recorder by building a copy of bin/ with the recorder in this place.
@@ -805,9 +965,17 @@ def paste(secret, cfg):
                           "keepass-picker-insert")
     env = dict(os.environ,
                KEEPASS_PICKER_PASTE_KEY=str(cfg["paste_key"]),
-               KEEPASS_PICKER_PRE_TYPE_DELAY=str(cfg["pre_type_delay"]))
-    proc = subprocess.Popen([helper], stdin=subprocess.PIPE, env=env)
-    proc.communicate(secret.encode())
+               KEEPASS_PICKER_PRE_TYPE_DELAY=str(cfg["pre_type_delay"]),
+               KEEPASS_PICKER_EXPECT_WINDOW=str(expect_window or ""))
+    proc = subprocess.Popen([helper], stdin=subprocess.PIPE, env=env,
+                            start_new_session=True)
+    try:
+        # Bounded: a helper that hangs would hold the secret in the clipboard
+        # and wedge the agent. Its whole process group goes with it.
+        proc.communicate(secret.encode(), timeout=MAX_DELAY * 2 + 10)
+    except subprocess.TimeoutExpired:
+        reap(proc, 0)
+        return False
     return proc.returncode == 0
 
 
@@ -1024,7 +1192,7 @@ class Agent:
                        "Focus moved mid-fill — the rest was not typed.")
                 return {"ok": False, "error": "focus moved during the sequence"}
 
-            ok = paste(secret, self.cfg)
+            ok = paste(secret, self.cfg, expected)
             del secret
             if not ok:
                 return {"ok": False, "error": "could not paste"}
@@ -1207,6 +1375,10 @@ class Agent:
         server.listen(8)
         bound = os.stat(path)
         self.socket_id = (bound.st_dev, bound.st_ino)
+        # Who we are, for the test suite and for anyone who wants to send a
+        # signal: the agent is non-dumpable, so /proc/<pid>/environ is closed
+        # to the user and a process cannot be found by it.
+        write_private_text(os.path.join(runtime_dir(), "agent.pid"), f"{os.getpid()}\n")
         log(f"listening on {path}")
 
         self.publish()
@@ -1242,15 +1414,26 @@ class Agent:
         if not same_user(conn):
             log("rejected a connection from another uid")
             return
-        conn.settimeout(120)
+        # The server is single-threaded: while a request is being read, no
+        # idle timer runs and no status is published. So a request is small
+        # and quick, or it is refused -- a client that dribbles bytes cannot
+        # hold the agent (and the unlocked vault) hostage.
+        conn.settimeout(5)
+        deadline = time.monotonic() + 5
         try:
             data = b""
             while not data.endswith(b"\n"):
+                if time.monotonic() > deadline:
+                    raise ValueError("request too slow")
                 chunk = conn.recv(65536)
                 if not chunk:
                     break
                 data += chunk
+                if len(data) > MAX_REQUEST:
+                    raise ValueError("request too large")
             request = json.loads(data.decode() or "{}")
+            if not isinstance(request, dict):
+                raise ValueError("request is not an object")
         except (OSError, ValueError) as exc:
             reply({"ok": False, "error": f"bad request: {exc}"}, conn)
             return
@@ -1263,6 +1446,9 @@ class Agent:
             log(f"unhandled error: {exc!r}")
             response = {"ok": False, "error": "internal error"}
         reply(response, conn)
+
+
+MAX_REQUEST = 64 * 1024
 
 
 def same_user(conn):
@@ -1281,6 +1467,8 @@ def reply(payload, conn):
 
 def main():
     os.umask(0o077)
+    scrub_environment()
+    harden_process()
     agent = Agent()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: sys.exit(0))
