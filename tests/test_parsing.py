@@ -140,7 +140,31 @@ class InsertHelperContract(unittest.TestCase):
     def test_marks_the_clipboard_sensitive(self):
         # Without this the password lands in
         # ~/.local/state/omarchy/clipboard-history.json in plaintext.
-        self.assertIn("--sensitive", self.src)
+        # Checked on the command lines themselves: the comment explaining the
+        # flag once satisfied a whole-file search after the flag was removed.
+        calls = [line for line in self.src.splitlines()
+                 if '"$wl_copy"' in line and not line.lstrip().startswith("#")]
+        self.assertTrue(calls, "no wl-copy call found")
+        for line in calls:
+            self.assertIn("--sensitive", line)
+
+    def test_pins_path_before_running_anything(self):
+        # `cat` and `wl-copy` are handed the secret. A fake of either in a
+        # user-writable directory early in PATH would receive it.
+        self.assertIn("\nexport PATH=/usr/bin\n", self.src)
+        pinned = self.src.index("\nexport PATH=/usr/bin\n")
+        self.assertLess(pinned, self.src.index("secret=$(cat)"))
+        self.assertLess(pinned, self.src.index("wl_copy=$(system_binary wl-copy)"))
+
+    def test_runs_the_verified_paths_not_the_names(self):
+        for line in self.src.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            with self.subTest(line=line):
+                self.assertNotRegex(line, r"(^\s*|[|;&]\s*)(wl-copy|wtype)(\s|$)",
+                                    "a helper run by name, not by verified path")
+        self.assertIn('"$wl_copy" --type', self.src)
+        self.assertIn('"$wtype" "${press[@]}"', self.src)
 
     def test_owns_the_clipboard_in_the_foreground_and_kills_it(self):
         # So the secret leaves the clipboard rather than lingering there.
@@ -238,9 +262,12 @@ class PinentryTheming(unittest.TestCase):
 
     def test_without_qt6ct_it_changes_nothing(self):
         # Degrades to exactly the behaviour before this existed.
-        if ka.which("qt6ct"):
-            self.skipTest("qt6ct is installed on this machine")
-        self.assertEqual(ka.pinentry_theme_env(), {})
+        real = ka.system_binary
+        ka.system_binary = lambda name: None if name == "qt6ct" else real(name)
+        try:
+            self.assertEqual(ka.pinentry_theme_env(), {})
+        finally:
+            ka.system_binary = real
 
     def test_a_monochrome_icon_set_is_preferred_over_the_themes(self):
         # An Omarchy theme names a full-colour desktop set (Yaru-red here),
@@ -299,6 +326,112 @@ class PinentryTheming(unittest.TestCase):
                           "expanduser(\"~/.config"):
             with self.subTest(token=forbidden):
                 self.assertNotIn(forbidden, fn)
+
+
+class HelpersComeFromUsrBinOnly(unittest.TestCase):
+    """No program the agent runs is looked up in $PATH.
+
+    Found in marketplace security review: pinentry was chosen through PATH, so
+    a fake pinentry-qt in ~/.local/bin would have been handed the master
+    password over Assuan, and a fake keepassxc-cli the password over its pty.
+    On the machine this was built on, `python3` already resolved to a
+    version manager's shim under $HOME -- the agent's own interpreter.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.environ.get("PATH", "")
+
+    def tearDown(self):
+        os.environ["PATH"] = self.path
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def plant(self, name):
+        fake = os.path.join(self.tmp, name)
+        with open(fake, "w") as fh:
+            fh.write("#!/bin/sh\nexit 97\n")
+        os.chmod(fake, 0o755)
+        return fake
+
+    def test_a_system_binary_resolves_to_an_absolute_path_in_usr(self):
+        found = ka.system_binary("sh")
+        self.assertIsNotNone(found)
+        self.assertTrue(found.startswith("/usr/"), found)
+
+    def test_an_earlier_path_entry_is_ignored(self):
+        for name in ("sh", "keepassxc-cli", "pinentry-qt"):
+            self.plant(name)
+        os.environ["PATH"] = self.tmp + os.pathsep + self.path
+        for name in ("sh", "keepassxc-cli", "pinentry-qt"):
+            with self.subTest(name=name):
+                found = ka.system_binary(name)
+                if found is not None:
+                    self.assertFalse(found.startswith(self.tmp), found)
+
+    def test_names_that_are_paths_are_refused(self):
+        for name in ("", ".", "..", "/usr/bin/sh", "../bin/sh", "./sh",
+                     self.plant("pinentry-qt")):
+            with self.subTest(name=name):
+                self.assertIsNone(ka.system_binary(name))
+
+    def test_a_missing_program_is_refused(self):
+        self.assertIsNone(ka.system_binary("keepass-picker-no-such-program"))
+
+    def test_only_root_controlled_locations_are_trusted(self):
+        self.assertTrue(ka._root_controlled("/usr/bin"))
+        # Owned by the user: anything running as the user could have put it there.
+        self.assertFalse(ka._root_controlled(self.plant("keepassxc-cli")))
+        self.assertFalse(ka._root_controlled(self.tmp))
+        # Owned by root but writable by everyone.
+        self.assertFalse(ka._root_controlled("/tmp"))
+        self.assertFalse(ka._root_controlled(os.path.join(self.tmp, "missing")))
+
+    def test_the_bare_pinentry_wrapper_is_never_tried(self):
+        # On Arch /usr/bin/pinentry sources ~/.config/pinentry/preexec, which
+        # the user can write. A configured preference is held to the same rule.
+        asked = []
+        real = ka.system_binary
+        ka.system_binary = lambda name: asked.append(name)
+        try:
+            for preferred in (None, "pinentry", self.plant("pinentry-qt")):
+                with self.assertRaises(ka.LockedError):
+                    ka.ask_password("probe.kdbx", preferred=preferred)
+        finally:
+            ka.system_binary = real
+        self.assertTrue(asked)
+        for name in asked:
+            self.assertTrue(name.startswith("pinentry-"), name)
+            self.assertNotIn("/", name)
+
+    def test_the_agent_names_no_program_to_run(self):
+        # Every subprocess gets a path system_binary verified, never a literal
+        # name for the kernel to find in PATH.
+        with open(os.path.join(BIN, "keepass_agent.py")) as fh:
+            src = fh.read()
+        self.assertNotRegex(src, r"subprocess\.(Popen|run|call|check_\w+)\(\s*\[\s*[\"']")
+        self.assertNotRegex(src, r"\bdef which\(|\bwhich\(")
+        self.assertNotIn("shutil.which", src)
+        self.assertNotIn('os.environ.get("PATH"', src)
+
+    def test_the_paste_helper_is_not_chosen_by_the_environment(self):
+        # Whatever runs as the paste helper is handed the secret on stdin.
+        with open(os.path.join(BIN, "keepass_agent.py")) as fh:
+            src = fh.read()
+        paste = src[src.index("def paste("):src.index("class Agent")]
+        self.assertNotIn("os.environ.get", paste)
+        self.assertNotIn("KEEPASS_PICKER_INSERT", src)
+
+    def test_the_interpreter_is_not_looked_up_in_path(self):
+        for name in ("keepass-agent", "keepass_agent.py"):
+            with self.subTest(name=name):
+                with open(os.path.join(BIN, name)) as fh:
+                    self.assertEqual(fh.readline().strip(), "#!/usr/bin/python3")
+
+    def test_the_client_pins_path_before_running_anything(self):
+        with open(os.path.join(BIN, "keepass-picker-ctl")) as fh:
+            src = fh.read()
+        pinned = src.index("\nexport PATH=/usr/bin\n")
+        self.assertLess(pinned, src.index("BIN_DIR=$("))
 
 
 class BarWidgetRunsNoProcess(unittest.TestCase):

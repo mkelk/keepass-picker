@@ -17,9 +17,10 @@ import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from helpers import (BIN, PROBE_ENTRIES, PROBE_PASSWORD, agent_pids,   # noqa: E402
-                     PINENTRY_NAMES, cleanup, ctl, fake_pinentry,
-                     make_vault, make_vault_at,
+from helpers import (BIN, HIJACKABLE, PROBE_ENTRIES, PROBE_PASSWORD,   # noqa: E402
+                     agent_pids, cleanup, ctl, desktop_log, fake_pinentry,
+                     hijack_log, hostile_path,
+                     make_vault, make_vault_at, plugin_bin, plugin_ctl, plugin_tree,
                      recording_insert, sandbox, sandbox_env, stop_agent,
                      write_config)
 
@@ -37,9 +38,9 @@ class AgentTestCase(unittest.TestCase):
         cls.root = sandbox()
         make_vault(cls.root)
         write_config(cls.root, idle_timeout=cls.idle_timeout)
-        fake_pinentry(cls.root)
+        plugin_tree(cls.root, fake_pinentry(cls.root))
         cls.helper, cls.record, cls.argv_log = recording_insert(cls.root)
-        cls.env = sandbox_env(cls.root, KEEPASS_PICKER_INSERT=cls.helper)
+        cls.env = sandbox_env(cls.root)
 
     @classmethod
     def tearDownClass(cls):
@@ -296,7 +297,7 @@ class OnlyOneAgentEverRuns(AgentTestCase):
         time.sleep(1)
 
         procs = [subprocess.Popen(
-            [os.path.join(BIN, "keepass-picker-ctl"), "status"],
+            [plugin_ctl(self.root), "status"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env)
             for _ in range(12)]
         for proc in procs:
@@ -311,7 +312,7 @@ class OnlyOneAgentEverRuns(AgentTestCase):
         time.sleep(1)
 
         procs = [subprocess.Popen(
-            [os.path.join(BIN, "keepass-picker-ctl"), "status"],
+            [plugin_ctl(self.root), "status"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env)
             for _ in range(12)]
         for proc in procs:
@@ -408,7 +409,7 @@ class NothingWaitsForever(AgentTestCase):
             time.sleep(1)
             start = time.monotonic()
             proc = subprocess.run(
-                [os.path.join(BIN, "keepass-picker-ctl"), "status"],
+                [plugin_ctl(self.root), "status"],
                 capture_output=True, text=True, env=self.env, timeout=60)
             elapsed = time.monotonic() - start
             self.assertLess(elapsed, 30, "ctl blocked on a held spawn lock")
@@ -434,7 +435,7 @@ class NothingWaitsForever(AgentTestCase):
         mute.listen(4)
         try:
             start = time.monotonic()
-            subprocess.run([os.path.join(BIN, "keepass-picker-ctl"), "status"],
+            subprocess.run([plugin_ctl(self.root), "status"],
                            capture_output=True, text=True, env=self.env,
                            timeout=90)
             self.assertLess(time.monotonic() - start, 45,
@@ -605,6 +606,36 @@ class WhatTheConfirmationPaneIsGiven(AgentTestCase):
         self.assertNotIn(SECRET, raw)
         self.assertNotIn("notes", raw.lower())
         self.assertNotIn("password", raw.lower())
+
+
+class ThePromptRunsThePathThatWasChecked(unittest.TestCase):
+    """The review's exact finding: pinentry was checked, then run by name.
+
+    ask_password used which() only as a yes/no and launched the bare name, so
+    the kernel searched PATH all over again and a fake pinentry-qt earlier in
+    PATH received the master password over Assuan.
+    """
+
+    def test_a_fake_pinentry_earlier_in_path_is_not_the_one_run(self):
+        root = sandbox()
+        saved = {k: os.environ.get(k) for k in ("PATH", "FAKE_PIN")}
+        real = agent.system_binary
+        try:
+            stub = fake_pinentry(root)
+            os.environ["PATH"] = hostile_path(root) + os.pathsep + saved["PATH"]
+            os.environ["FAKE_PIN"] = PROBE_PASSWORD
+            agent.system_binary = lambda name: stub if name == "pinentry-qt" else None
+            self.assertEqual(agent.ask_password("probe.kdbx"), PROBE_PASSWORD)
+            self.assertFalse(os.path.exists(hijack_log(root)),
+                             "a pinentry was found through PATH")
+        finally:
+            agent.system_binary = real
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            cleanup(root)
 
 
 class ThePromptIsAWaylandClient(unittest.TestCase):
@@ -843,12 +874,14 @@ class TheLiveSessionIsUntouched(AgentTestCase):
             with self.subTest(line=line):
                 self.assertIn(line, src)
 
-    def test_the_stub_shadows_every_name_the_agent_might_try(self):
-        bindir = os.path.join(self.root, "bin")
-        for name in PINENTRY_NAMES:
-            with self.subTest(name=name):
-                self.assertTrue(os.access(os.path.join(bindir, name), os.X_OK),
-                                f"{name} is not shadowed in the sandbox")
+    def test_no_keystroke_or_notification_reached_the_desktop(self):
+        # A fill presses Tab between the username and the password. Before the
+        # agent under test was given a recording wtype, every run of this suite
+        # sent that Tab to whatever window had focus.
+        self.unlocked()
+        self.ctl("fill", "/Plain")
+        with open(desktop_log(self.root)) as fh:
+            self.assertIn("wtype -k Tab", fh.read())
 
     def test_the_clipboard_history_was_not_written(self):
         # If the paste helper ever ran for real without --sensitive, the
@@ -863,6 +896,76 @@ class TheLiveSessionIsUntouched(AgentTestCase):
         if os.path.exists(history):
             with open(history, "rb") as fh:
                 self.assertNotIn(SECRET.encode(), fh.read())
+
+
+class NothingIsFoundThroughPath(AgentTestCase):
+    """The marketplace security review's finding, as an attack that must fail.
+
+    sandbox_env() puts a directory ahead of the real PATH holding a fake of
+    every program the plugin runs -- pinentry-qt, keepassxc-cli, wl-copy,
+    wtype, hyprctl, python3, and the commands the scripts use. A fake
+    pinentry-qt there would have been handed the master password. Each fake
+    records that it ran; a whole session must run none of them.
+    """
+
+    def start_agent_with_the_hostile_path(self):
+        # Not through ctl: ctl pins PATH=/usr/bin for everything it starts,
+        # which would hide an agent that looked a program up in PATH itself --
+        # the bare keepassxc-cli the review found passed this test that way.
+        stop_agent(self.root, self.env)
+        time.sleep(1)
+        sock = os.path.join(self.env["XDG_RUNTIME_DIR"], "keepass-picker", "agent.sock")
+        os.makedirs(os.path.dirname(sock), mode=0o700, exist_ok=True)
+        subprocess.Popen([os.path.join(plugin_bin(self.root), "keepass-agent")],
+                         env=self.env, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        for _ in range(50):
+            if os.path.exists(sock):
+                return
+            time.sleep(0.1)
+        self.fail("the agent did not start")
+
+    def test_a_whole_session_runs_no_impostor(self):
+        self.start_agent_with_the_hostile_path()
+        self.unlocked()
+        self.ctl("search", "Plain")
+        self.ctl("target")
+        self.ctl("insert", "/Plain")
+        self.ctl("fill", "/Plain")
+        self.ctl("insert", "/Plain", "Password", "0xXXstale")
+        self.ctl("lock")
+        self.ctl("status")
+        ran = []
+        if os.path.exists(hijack_log(self.root)):
+            with open(hijack_log(self.root)) as fh:
+                ran = fh.read().split()
+        self.assertEqual(ran, [], f"run from PATH: {sorted(set(ran))}")
+
+    def test_the_impostors_really_come_first(self):
+        # Otherwise the test above proves nothing.
+        first = self.env["PATH"].split(os.pathsep)[0]
+        for name in HIJACKABLE:
+            with self.subTest(name=name):
+                found = subprocess.run(["/usr/bin/bash", "-c", f"command -v {name}"],
+                                       env=self.env, capture_output=True,
+                                       text=True).stdout.strip()
+                self.assertEqual(found, os.path.join(first, name))
+
+    def test_the_agent_inherits_only_usr_bin(self):
+        stop_agent(self.root, self.env)
+        time.sleep(1)
+        self.ctl("status")
+        pids = agent_pids(self.env["XDG_RUNTIME_DIR"])
+        self.assertTrue(pids)
+        for pid in pids:
+            with open(f"/proc/{pid}/environ", "rb") as fh:
+                self.assertIn(b"PATH=/usr/bin", fh.read().split(b"\0"))
+
+    def test_the_agent_runs_under_the_system_interpreter(self):
+        self.ctl("status")
+        for pid in agent_pids(self.env["XDG_RUNTIME_DIR"]):
+            exe = os.path.realpath(f"/proc/{pid}/exe")
+            self.assertTrue(exe.startswith("/usr/bin/python"), exe)
 
 
 def children_of(name):

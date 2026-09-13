@@ -11,6 +11,38 @@
 
 set -uo pipefail
 
+# /usr/bin only, never the caller's PATH: `cat` and `wl-copy` below are handed
+# the secret, and a user-writable directory early in PATH could put a fake of
+# either in front of the real one.
+export PATH=/usr/bin
+
+# True if root owns $1 and every directory above it, and none of them is
+# writable by anyone else -- so only root can have put the file there.
+root_controlled() {
+  local path=$1 owner mode
+  while :; do
+    read -r owner mode < <(stat -c '%u %a' -- "$path" 2>/dev/null) || return 1
+    (( owner == 0 && (8#$mode & 8#022) == 0 )) || return 1
+    [[ $path == / ]] && return 0
+    path=$(dirname -- "$path")
+  done
+}
+
+# The verified absolute path of a /usr/bin program; the caller runs that path.
+# Mirrors system_binary in keepass_agent.py.
+system_binary() {
+  local link="/usr/bin/$1" real
+  [[ -n $1 && $1 != */* && $1 != . && $1 != .. ]] || return 1
+  real=$(readlink -e -- "$link") || return 1
+  [[ -f $real && -x $real ]] || return 1
+  [[ $(stat -c '%u' -- "$link") == 0 ]] || return 1
+  root_controlled /usr/bin && root_controlled "$real" || return 1
+  printf '%s\n' "$real"
+}
+
+wl_copy=$(system_binary wl-copy) || { echo "keepass-picker-insert: no root-owned wl-copy in /usr/bin" >&2; exit 1; }
+wtype=$(system_binary wtype) || { echo "keepass-picker-insert: no root-owned wtype in /usr/bin" >&2; exit 1; }
+
 paste_key="${KEEPASS_PICKER_PASTE_KEY:-shift+Insert}"
 pre_type_delay="${KEEPASS_PICKER_PRE_TYPE_DELAY:-0.15}"
 
@@ -30,7 +62,7 @@ done
 # --sensitive is what keeps this out of ~/.local/state/omarchy/clipboard-history.json.
 # --foreground plus the kill means the clipboard owner dies, so the secret
 # leaves the clipboard entirely rather than lingering there.
-printf '%s' "$secret" | wl-copy --type text/plain --sensitive --foreground &
+printf '%s' "$secret" | "$wl_copy" --type text/plain --sensitive --foreground &
 copy_pid=$!
 unset secret
 
@@ -40,7 +72,7 @@ sleep "$pre_type_delay"
 
 # Paste rather than type: wtype emits the wrong symbols under non-US keymaps,
 # and that corruption is invisible on a string you cannot see.
-wtype "${press[@]}" -k "$key" "${release[@]}" 2>/dev/null || true
+"$wtype" "${press[@]}" -k "$key" "${release[@]}" 2>/dev/null || true
 
 sleep 0.2
 kill "$copy_pid" 2>/dev/null || true

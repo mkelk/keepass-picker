@@ -18,6 +18,11 @@
 
 set -uo pipefail
 
+# /usr/bin only, for this script and everything it starts: the agent, and
+# through it pinentry and keepassxc-cli. The agent resolves each of those
+# itself and never consults PATH, but it should not inherit one worth trying.
+export PATH=/usr/bin
+
 APP=keepass-picker
 BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$APP"

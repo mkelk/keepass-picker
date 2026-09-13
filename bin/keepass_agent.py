@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Session agent for keepass-picker.
 
 Holds one KeePass database unlocked by supervising an interactive
@@ -28,6 +28,7 @@ import re
 import select
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -209,12 +210,15 @@ class Vault:
             return
         if not self.database or not os.path.isfile(self.database):
             raise LockedError("no database configured")
+        cli = system_binary("keepassxc-cli")
+        if cli is None:
+            raise LockedError(f"keepassxc-cli is not installed in {SYSTEM_BIN}")
 
         master, slave = pty.openpty()
         # A wide pty keeps readline from redisplaying long input across lines.
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 4096, 0, 0))
         self.proc = subprocess.Popen(
-            ["keepassxc-cli", "open", self.database],
+            [cli, "open", self.database],
             stdin=slave, stdout=slave, stderr=slave,
             close_fds=True, start_new_session=True,
         )
@@ -490,7 +494,7 @@ def pinentry_theme_env(icon_preference=""):
     Returns {} when qt6ct is not installed or the theme cannot be read, and
     the prompt then looks exactly as it did before.
     """
-    if not which("qt6ct"):
+    if not system_binary("qt6ct"):
         return {}
     c = theme_colors()
     if not c:
@@ -585,12 +589,20 @@ def ask_password(database, preferred=None, cfg=None):
     # separate process at all rather than a field in the picker: QML strings
     # are immutable, garbage-collected and never zeroed, in a shell that lives
     # for the whole session and hosts other people's plugins.
+    #
+    # Real flavours only, never the bare `pinentry`: on Arch that is a wrapper
+    # script that sources ~/.config/pinentry/preexec, a file anything running
+    # as the user can write, before choosing a flavour. A configured preference
+    # is held to the same rule, and like every flavour it must resolve in
+    # /usr/bin -- see system_binary.
     cfg = cfg or {}
     order = ([preferred] if preferred else []) + [
-        "pinentry-qt", "pinentry-gnome3", "pinentry-gtk", "pinentry"]
-    binary = next((b for b in order if b and which(b)), None)
+        "pinentry-qt", "pinentry-gnome3", "pinentry-gtk"]
+    binary = next((path for path in (system_binary(name) for name in order
+                                     if name and name.startswith("pinentry-"))
+                   if path), None)
     if binary is None:
-        raise LockedError("no pinentry available to prompt for the password")
+        raise LockedError(f"no pinentry in {SYSTEM_BIN} to prompt for the password")
 
     # No stylesheet argument: pinentry parses its own options and rejects Qt's,
     # so `-stylesheet` gets "invalid option". The palette arrives through the
@@ -660,12 +672,53 @@ def unescape_assuan(value):
     return "".join(out)
 
 
-def which(binary):
-    for d in os.environ.get("PATH", "/usr/bin").split(os.pathsep):
-        candidate = os.path.join(d, binary)
-        if os.access(candidate, os.X_OK):
-            return candidate
-    return None
+# Every program this agent runs comes from here, by absolute path, and never
+# from $PATH. pinentry is handed the master password and keepassxc-cli is
+# handed the vault; a user-writable directory early in PATH -- ~/.local/bin, a
+# version manager's shims -- could otherwise put a fake of either in front of
+# the real one. That covers the helpers that only decide where a secret lands
+# (hyprctl, wtype) too, and the interpreter: both shebangs name /usr/bin/python3.
+SYSTEM_BIN = "/usr/bin"
+
+
+def _root_controlled(path):
+    """True if root owns `path` and every directory above it, and none of them
+    is writable by anyone else -- so only root can have put the file there."""
+    while True:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return False
+        if st.st_uid != 0 or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return False
+        parent = os.path.dirname(path)
+        if parent == path:
+            return True
+        path = parent
+
+
+def system_binary(name):
+    """The verified absolute path of `name` in /usr/bin, or None.
+
+    Symlinks are followed and the target is checked as well as the link, so a
+    link out of /usr/bin into somewhere writable is refused. The caller runs the
+    returned path, not the name, so nothing is looked up a second time.
+    """
+    if not name or "/" in name or name in (".", ".."):
+        return None
+    link = os.path.join(SYSTEM_BIN, name)
+    try:
+        if os.lstat(link).st_uid != 0:
+            return None
+        real = os.path.realpath(link)
+        mode = os.stat(real).st_mode
+    except OSError:
+        return None
+    if not stat.S_ISREG(mode) or not os.access(real, os.X_OK):
+        return None
+    if not (_root_controlled(SYSTEM_BIN) and _root_controlled(real)):
+        return None
+    return real
 
 
 SEQUENCE_RE = re.compile(r"\{([A-Z]+)\}")
@@ -699,9 +752,15 @@ def parse_sequence(text):
 
 
 def focused_window():
-    """Address, class and title of the window a paste would land in."""
+    """Address, class and title of the window a paste would land in.
+
+    {} when it cannot be read, which the focus guard treats as "moved".
+    """
+    hyprctl = system_binary("hyprctl")
+    if hyprctl is None:
+        return {}
     try:
-        out = subprocess.run(["hyprctl", "activewindow", "-j"],
+        out = subprocess.run([hyprctl, "activewindow", "-j"],
                              capture_output=True, text=True, timeout=3)
         data = json.loads(out.stdout or "{}")
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -713,11 +772,11 @@ def focused_window():
 
 
 def notify(title, body):
-    for command in (["omarchy-notification-send", title, body],
-                    ["notify-send", title, body]):
-        if which(command[0]):
+    for name in ("omarchy-notification-send", "notify-send"):
+        binary = system_binary(name)
+        if binary:
             try:
-                subprocess.Popen(command, stdout=subprocess.DEVNULL,
+                subprocess.Popen([binary, title, body], stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL)
             except OSError:
                 pass
@@ -726,8 +785,11 @@ def notify(title, body):
 
 def press(key):
     """A bare keystroke. No secret, so argv is fine."""
+    wtype = system_binary("wtype")
+    if wtype is None:
+        return False
     try:
-        subprocess.run(["wtype", "-k", key], timeout=5,
+        subprocess.run([wtype, "-k", key], timeout=5,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except (OSError, subprocess.SubprocessError):
@@ -736,11 +798,11 @@ def press(key):
 
 def paste(secret, cfg):
     """Hand the secret to the insert helper on stdin -- never in argv."""
-    # Overridable so the test suite can substitute a recorder: the real helper
-    # drives the live clipboard and sends a keystroke to whatever window has
-    # focus, which must never happen in an unattended run.
-    helper = os.environ.get("KEEPASS_PICKER_INSERT") or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "keepass-picker-insert")
+    # Always the helper beside this file, never one named by the environment:
+    # whatever runs here is handed the secret. The test suite substitutes its
+    # recorder by building a copy of bin/ with the recorder in this place.
+    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "keepass-picker-insert")
     env = dict(os.environ,
                KEEPASS_PICKER_PASTE_KEY=str(cfg["paste_key"]),
                KEEPASS_PICKER_PRE_TYPE_DELAY=str(cfg["pre_type_delay"]))

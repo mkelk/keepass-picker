@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "mkelk.keepass-picker",
   "name": "KeePass Picker",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "author": "Morten Elk",
   "license": "MIT",
   "description": "Search a KeePass database and paste a credential into the focused window. Read-only and offline: KeePassXC stays the writer and the security boundary.",

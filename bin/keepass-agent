@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Executable shim. The logic lives in keepass_agent.py so tests can import it."""
 import os
 import sys

@@ -166,6 +166,18 @@ If the focused window changes between opening the picker and the paste, the
 agent aborts and tells you; mid-fill, a stray username is recoverable and a
 stray password is not, so it stops there.
 
+**What it runs, and from where.** Only programs in `/usr/bin`, each by its
+absolute path, after checking that root owns the file and every directory above
+it and that nobody else can write to them — never whatever `$PATH` finds first.
+`pinentry` is handed the master password and `keepassxc-cli` the vault, so a
+fake of either in `~/.local/bin` or a version manager's shims would otherwise
+receive them. The same holds for `wl-copy`, `wtype`, `hyprctl` and the agent's
+own interpreter (`#!/usr/bin/python3`); both scripts set `PATH=/usr/bin` before
+running anything, and the paste helper is always the one installed beside the
+agent. The bare `pinentry` wrapper is never used: it sources
+`~/.config/pinentry/preexec`, which any process running as you can write. A
+missing or tampered program is reported as missing, not worked around.
+
 **What it stores.** Two files, both `0600`, neither containing a secret: a
 status file with the lock state, the database's basename and a coarse
 countdown; and `usage.json`, a record of which entries you used and when.
@@ -210,7 +222,7 @@ never a password.
 | `fill_step_delay` | `0.12` | Seconds between steps of a fill |
 | `pre_type_delay` | `0.15` | Seconds before the first keystroke; virtual keyboards need a moment |
 | `search_paths` | `$HOME` | Colon-separated roots `configure` scans for `.kdbx` files. Keep them disjoint |
-| `pinentry` | `""` | Which pinentry to use; blank prefers `pinentry-qt` |
+| `pinentry` | `""` | Which pinentry flavour to use, as a `pinentry-*` name in `/usr/bin`; blank prefers `pinentry-qt` |
 | `pinentry_icon_theme` | `""` | Blank prefers a monochrome icon set over the theme's colourful one |
 | `mask_character` | `"·"` | What stands in for each typed character in the prompt |
 
@@ -226,9 +238,11 @@ own Qt or GTK configuration is written. It follows a theme switch with no work.
 omarchy plugin validate .
 ```
 
-No test touches your real vault, agent or clipboard: each run gets its own
-config, runtime directory, generated vault, stub pinentry and recording paste
-helper, and asserts afterwards that the live session was untouched.
+No test touches your real vault, agent, clipboard or keyboard: each run gets
+its own config, runtime directory, generated vault, stub pinentry, and
+recording paste helper and `wtype`, and asserts afterwards that the live
+session was untouched. Its `PATH` starts with a directory of impostors — a fake
+of every program the plugin runs — and a whole session must run none of them.
 `tests/live-paste.sh` is the one exception and only runs when you ask it to.
 
 **This repository is the installed tree.** `omarchy plugin add` clones it and
